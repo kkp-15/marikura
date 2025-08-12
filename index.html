@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>クラフト横スク - START→GOAL</title>
+<style>
+  html,body{margin:0;height:100%;background:#87CEEB;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+  #ui{
+    position:fixed;left:12px;top:12px;background:rgba(255,255,255,.9);
+    padding:10px 12px;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.12);user-select:none
+  }
+  #ui b{display:block;margin-bottom:6px}
+  #msg{
+    position:fixed;left:50%;top:20%;transform:translateX(-50%);
+    background:rgba(0,0,0,.75);color:#fff;padding:12px 18px;border-radius:12px;font-size:18px;display:none
+  }
+  #btns{
+    position:fixed;right:12px;top:12px;display:flex;gap:8px
+  }
+  button{
+    padding:8px 12px;border:0;border-radius:10px;background:#111;color:#fff;cursor:pointer;
+    box-shadow:0 6px 16px rgba(0,0,0,.18)
+  }
+  button:hover{opacity:.9}
+  canvas{display:block}
+  #credit{position:fixed;right:10px;bottom:8px;font-size:12px;color:#0008}
+</style>
+</head>
+<body>
+<div id="ui">
+  <b>操作</b>
+  ・←/→ or A/D：移動<br>
+  ・W or Space：ジャンプ<br>
+  ・左クリック：置く（在庫↓）<br>
+  ・右クリック：壊す（在庫↑）<br>
+  ・射程：5マス / グリッド：32px
+  <div style="margin-top:6px">在庫：<span id="inv">0</span> ブロック</div>
+</div>
+<div id="btns">
+  <button id="restart">Restart</button>
+</div>
+<div id="msg"></div>
+<div id="credit">craft-run demo</div>
+<canvas id="game"></canvas>
+
+<script>
+(() => {
+  // ===== 基本設定 =====
+  const TILE = 32;
+  const WORLD_W = 200;  // 横タイル数
+  const WORLD_H = 20;   // 縦タイル数
+  const GROUND_Y = 14;  // 地表ライン
+  const GRAV = 0.8;
+  const MOVE = 0.6;
+  const MAX_XS = 5;
+  const JUMP_V = -12;
+
+  // タイル種別
+  const AIR = 0;
+  const DIRT = 1;     // 地面（固い）
+  const BLOCK = 2;    // プレイヤー設置ブロック（固い）
+  const START = 3;
+  const GOAL = 4;
+
+  // 画面
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // UI
+  const msg = document.getElementById('msg');
+  const invEl = document.getElementById('inv');
+  const restartBtn = document.getElementById('restart');
+
+  // 入力
+  const key = {};
+  window.addEventListener('keydown', e => key[e.key.toLowerCase()] = true);
+  window.addEventListener('keyup',   e => key[e.key.toLowerCase()] = false);
+
+  // 右クリックメニュー無効
+  window.addEventListener('contextmenu', e => e.preventDefault());
+
+  // カメラ
+  let camX = 0, camY = 0;
+
+  // マウス（ワールド座標）
+  let mouseX = 0, mouseY = 0;
+  canvas.addEventListener('mousemove', e => {
+    const rect = canvas.getBoundingClientRect();
+    const sx = (e.clientX - rect.left);
+    const sy = (e.clientY - rect.top);
+    mouseX = sx + camX;
+    mouseY = sy + camY;
+  });
+
+  // クリックで置く/壊す
+  canvas.addEventListener('mousedown', e => {
+    if (gameOver) return;
+    const tx = Math.floor(mouseX / TILE);
+    const ty = Math.floor(mouseY / TILE);
+    if (!inWorld(tx, ty)) return;
+    // 射程チェック
+    const dx = tx + 0.5 - (player.x / TILE);
+    const dy = ty + 0.5 - (player.y / TILE);
+    const dist = Math.hypot(dx, dy);
+    if (dist > 5) return;
+
+    if (e.button === 0) { // 左：置く
+      if (world[ty][tx] === AIR && inventory > 0 && !isStartGoal(tx, ty)) {
+        world[ty][tx] = BLOCK;
+        inventory--;
+        updateInv();
+      }
+    } else if (e.button === 2) { // 右：壊す
+      const t = world[ty][tx];
+      if ((t === BLOCK || t === DIRT) && !isStartGoal(tx, ty)) {
+        world[ty][tx] = AIR;
+        inventory++;
+        updateInv();
+      }
+    }
+  });
+
+  // 画面リサイズ
+  function fit() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    canvas.width = w;
+    canvas.height = h;
+  }
+  window.addEventListener('resize', fit);
+  fit();
+
+  // ===== ワールド生成 =====
+  let world, player, inventory, gameOver, clearFlag;
+
+  function genWorld() {
+    world = Array.from({length: WORLD_H}, _ => Array(WORLD_W).fill(AIR));
+
+    // 地表ライン以下はDIRT
+    for (let x = 0; x < WORLD_W; x++) {
+      for (let y = GROUND_Y; y < WORLD_H; y++) {
+        world[y][x] = DIRT;
+      }
+    }
+    // いくつか穴
+    for (let i = 0; i < 18; i++) {
+      const x0 = 10 + Math.floor(Math.random() * (WORLD_W - 20));
+      const w = 2 + Math.floor(Math.random() * 4);
+      for (let x = x0; x < Math.min(WORLD_W, x0 + w); x++) {
+        for (let y = GROUND_Y; y < WORLD_H; y++) world[y][x] = AIR;
+      }
+    }
+    // 足場ブロック（浮島）
+    for (let i = 0; i < 35; i++) {
+      const x = 8 + Math.floor(Math.random() * (WORLD_W - 16));
+      const y = 6 + Math.floor(Math.random() * 6);
+      const w = 2 + Math.floor(Math.random() * 4);
+      for (let k = 0; k < w; k++) {
+        if (inWorld(x+k, y)) world[y][x+k] = DIRT;
+      }
+    }
+    // START / GOAL
+    world[GROUND_Y-1][2] = START;
+    world[GROUND_Y-1][WORLD_W-3] = GOAL;
+  }
+
+  function resetGame() {
+    genWorld();
+    player = { x: TILE*2, y: TILE*(GROUND_Y-2), vx: 0, vy: 0, w: 24, h: 28, onGround:false };
+    inventory = 10; // 初期在庫
+    gameOver = false;
+    clearFlag = false;
+    camX = 0; camY = 0;
+    msg.style.display = 'none';
+    updateInv();
+  }
+
+  restartBtn.addEventListener('click', resetGame);
+
+  function updateInv(){ invEl.textContent = inventory; }
+  function inWorld(tx, ty){ return tx >= 0 && ty >= 0 && tx < WORLD_W && ty < WORLD_H; }
+  function isSolid(t){ return t === DIRT || t === BLOCK; }
+  function isStartGoal(tx,ty){ return world[ty][tx] === START || world[ty][tx] === GOAL; }
+
+  // ===== 物理＆衝突 =====
+  function stepPlayer() {
+    // 入力
+    const left  = key['arrowleft'] || key['a'];
+    const right = key['arrowright'] || key['d'];
+    const jump  = key['w'] || key[' '] || key['arrowup'];
+
+    if (left)  player.vx -= MOVE;
+    if (right) player.vx += MOVE;
+
+    // 摩擦＆速度制限
+    player.vx *= 0.85;
+    if (player.vx >  MAX_XS) player.vx =  MAX_XS;
+    if (player.vx < -MAX_XS) player.vx = -MAX_XS;
+
+    // 重力
+    player.vy += GRAV;
+    if (player.vy > 20) player.vy = 20;
+
+    // ジャンプ（着地時のみ）
+    if (jump && player.onGround) {
+      player.vy = JUMP_V;
+      player.onGround = false;
+    }
+
+    // X移動＆衝突
+    player.x += player.vx;
+    collideAxis('x');
+
+    // Y移動＆衝突
+    player.y += player.vy;
+    player.onGround = false;
+    collideAxis('y');
+
+    // ゴール判定
+    const tx = Math.floor((player.x + player.w/2) / TILE);
+    const ty = Math.floor((player.y + player.h/2) / TILE);
+    if (inWorld(tx,ty) && world[ty][tx] === GOAL) {
+      clearFlag = true;
+      endGame("🎉 CLEAR! お見事！");
+    }
+
+    // 落下死（画面外）
+    if (player.y > TILE * (WORLD_H + 2)) {
+      endGame("💀 GAME OVER");
+    }
+
+    // カメラ追従
+    const marginX = canvas.width*0.35;
+    const target = player.x - canvas.width/2 + player.w/2;
+    if (target > camX + marginX) camX = target - marginX;
+    if (target < camX - marginX) camX = target + marginX;
+    camX = Math.max(0, Math.min(camX, WORLD_W*TILE - canvas.width));
+    camY = 0; // 縦は固定（必要なら追従も可）
+  }
+
+  function collideAxis(axis) {
+    // プレイヤーのAABBから接しているタイルだけ調べる
+    const minX = Math.floor((player.x)/TILE)-1;
+    const maxX = Math.floor((player.x+player.w)/TILE)+1;
+    const minY = Math.floor((player.y)/TILE)-1;
+    const maxY = Math.floor((player.y+player.h)/TILE)+1;
+
+    for (let ty = minY; ty <= maxY; ty++) {
+      for (let tx = minX; tx <= maxX; tx++) {
+        if (!inWorld(tx,ty)) continue;
+        const t = world[ty][tx];
+        if (!isSolid(t)) continue;
+
+        // タイルのAABB
+        const rx = tx*TILE, ry = ty*TILE, rw = TILE, rh = TILE;
+        if (aabbOverlap(player.x, player.y, player.w, player.h, rx, ry, rw, rh)) {
+          const overlapX1 = (player.x + player.w) - rx;     // 右からめり込み
+          const overlapX2 = (rx + rw) - player.x;           // 左からめり込み
+          const overlapY1 = (player.y + player.h) - ry;     // 下から
+          const overlapY2 = (ry + rh) - player.y;           // 上から
+
+          if (axis === 'x') {
+            if (overlapX1 < overlapX2) {
+              // 左へ押し戻す
+              player.x -= overlapX1;
+              if (player.vx > 0) player.vx = 0;
+            } else {
+              // 右へ押し戻す
+              player.x += overlapX2;
+              if (player.vx < 0) player.vx = 0;
+            }
+          } else { // y
+            if (overlapY1 < overlapY2) {
+              // 上から着地
+              player.y -= overlapY1;
+              if (player.vy > 0) {
+                player.vy = 0;
+                player.onGround = true;
+              }
+            } else {
+              // 下から頭ぶつけ
+              player.y += overlapY2;
+              if (player.vy < 0) player.vy = 0;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  function aabbOverlap(ax,ay,aw,ah, bx,by,bw,bh){
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  // ===== 描画 =====
+  function draw() {
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    // 空
+    drawSky();
+
+    // タイル
+    const x0 = Math.floor(camX / TILE) - 1;
+    const x1 = Math.floor((camX + canvas.width) / TILE) + 1;
+    for (let ty = 0; ty < WORLD_H; ty++) {
+      for (let tx = Math.max(0, x0); tx <= Math.min(WORLD_W-1, x1); tx++) {
+        const t = world[ty][tx];
+        if (t === AIR) continue;
+        const sx = tx*TILE - camX;
+        const sy = ty*TILE - camY;
+
+        if (t === DIRT) {
+          ctx.fillStyle = '#8B5A2B';
+          ctx.fillRect(sx, sy, TILE, TILE);
+          ctx.fillStyle = '#6f431f';
+          ctx.fillRect(sx, sy+TILE-6, TILE, 6);
+        } else if (t === BLOCK) {
+          ctx.fillStyle = '#c9a86a';
+          ctx.fillRect(sx, sy, TILE, TILE);
+          ctx.strokeStyle = 'rgba(0,0,0,.25)';
+          ctx.strokeRect(sx+0.5, sy+0.5, TILE-1, TILE-1);
+        } else if (t === START) {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(sx, sy, TILE, TILE);
+          ctx.strokeStyle = '#000';
+          ctx.strokeRect(sx+0.5, sy+0.5, TILE-1, TILE-1);
+          ctx.fillStyle = '#000';
+          ctx.font = '12px sans-serif';
+          ctx.fillText('START', sx-4, sy-6);
+        } else if (t === GOAL) {
+          // 旗
+          ctx.fillStyle = '#444';
+          ctx.fillRect(sx+TILE*0.7, sy+TILE*0.1, 4, TILE*0.9);
+          ctx.fillStyle = '#ff3b3b';
+          ctx.beginPath();
+          ctx.moveTo(sx+TILE*0.7+4, sy+TILE*0.1);
+          ctx.lineTo(sx+TILE*0.7+4+TILE*0.6, sy+TILE*0.25);
+          ctx.lineTo(sx+TILE*0.7+4, sy+TILE*0.4);
+          ctx.closePath();
+          ctx.fill();
+          ctx.fillStyle = '#000';
+          ctx.font = '12px sans-serif';
+          ctx.fillText('GOAL', sx-2, sy-6);
+        }
+      }
+    }
+
+    // プレイヤー
+    const px = Math.floor(player.x - camX);
+    const py = Math.floor(player.y - camY);
+    ctx.fillStyle = '#1E90FF';
+    ctx.fillRect(px, py, player.w, player.h);
+    // 顔
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(px+6, py+6, 5, 5);
+    ctx.fillRect(px+player.w-11, py+6, 5, 5);
+
+    // 目印（マウスのタイル枠）
+    const tx = Math.floor(mouseX / TILE);
+    const ty = Math.floor(mouseY / TILE);
+    if (inWorld(tx,ty)) {
+      ctx.strokeStyle = 'rgba(0,0,0,.35)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(tx*TILE - camX + 1, ty*TILE - camY + 1, TILE-2, TILE-2);
+    }
+
+    // ステージ名
+    ctx.fillStyle = 'rgba(0,0,0,.45)';
+    ctx.font = '14px system-ui, sans-serif';
+    ctx.fillText('START → GOAL（クラフト可）', 16, canvas.height - 14);
+  }
+
+  function drawSky(){
+    // うっすら地平線
+    const h = canvas.height;
+    const grad = ctx.createLinearGradient(0,0,0,h);
+    grad.addColorStop(0, '#87CEEB');
+    grad.addColorStop(1, '#cfefff');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+
+    // 適当な雲
+    ctx.fillStyle = 'rgba(255,255,255,.8)';
+    const base = Math.floor(camX*0.2);
+    for (let i=0;i<6;i++){
+      const x = ((i*260 + base) % (canvas.width+400)) - 200;
+      const y = 40 + (i%3)*30;
+      ctx.beginPath();
+      ctx.ellipse(x, y, 60, 22, 0, 0, Math.PI*2);
+      ctx.ellipse(x+40, y+10, 50, 18, 0, 0, Math.PI*2);
+      ctx.ellipse(x-40, y+6, 45, 16, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  // ===== ループ =====
+  let rafId = 0;
+  function loop(){
+    stepPlayer();
+    draw();
+    if (!gameOver) rafId = requestAnimationFrame(loop);
+  }
+
+  function endGame(text){
+    gameOver = true;
+    msg.textContent = text;
+    msg.style.display = 'block';
+    cancelAnimationFrame(rafId);
+  }
+
+  // 起動
+  resetGame();
+  loop();
+})();
+</script>
+</body>
+</html>
